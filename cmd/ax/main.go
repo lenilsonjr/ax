@@ -180,7 +180,7 @@ Available Commands:
   describe workspace <name> Show detailed information about a workspace
   describe model <name>   Show detailed information about a model
   watch task <name>       Stream live status and condition updates for a task
-  ssh <task-name> [-- cmd] Run a command or shell inside the running task container
+  ssh [-i] <task> [-- cmd] Run a command inside the running task container (-i: forward stdin)
   suspend task <name>     Suspend execution of a task and checkpoint state
   resume task <name>      Resume execution of a suspended task
   delete task <name>      Delete a task
@@ -1117,9 +1117,18 @@ func runTunnel(args []string) error {
 
 func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
+		return fmt.Errorf("usage: ax ssh [-i] <task-name> [-- command...]")
 	}
 
+	// -i forwards this process's stdin to the command (e.g. piping a tarball).
+	interactiveStdin := false
+	if args[0] == "-i" {
+		interactiveStdin = true
+		args = args[1:]
+		if len(args) == 0 {
+			return fmt.Errorf("usage: ax ssh [-i] <task-name> [-- command...]")
+		}
+	}
 	taskName := args[0]
 	var cmdToRun []string
 	for i := 1; i < len(args); i++ {
@@ -1186,13 +1195,27 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	)
 
 	// 1. First, check if worker IP is directly reachable (e.g. within cluster or local mesh)
+	// AX_SSH_DIRECT=0 skips the direct probe: from outside the cluster network
+	// (e.g. a laptop against kind) it always times out, adding 500ms per call.
 	d := net.Dialer{Timeout: 500 * time.Millisecond}
 	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	if testConn, dialErr := d.Dial("tcp", guestEndpoint); dialErr == nil {
+	var testConn net.Conn
+	dialErr := fmt.Errorf("direct dial disabled by AX_SSH_DIRECT=0")
+	if os.Getenv("AX_SSH_DIRECT") != "0" {
+		testConn, dialErr = d.Dial("tcp", guestEndpoint)
+	}
+	if dialErr == nil {
 		_ = testConn.Close()
 		guestClient, err = guest.Dial(guestEndpoint)
 		if err != nil {
 			return fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
+		}
+	} else if routerAddr := os.Getenv("AX_ROUTER_ADDR"); routerAddr != "" {
+		// 2a. A long-lived tunnel to atenet-router the caller already runs:
+		// skips spawning a port-forward per call.
+		guestClient, err = guest.DialTarget(routerAddr, targetActor)
+		if err != nil {
+			return fmt.Errorf("connecting to guest via AX_ROUTER_ADDR %s: %w", routerAddr, err)
 		}
 	} else {
 		// 2. Connect via the Substrate atenet-router service in ate-system (port 80)
@@ -1213,16 +1236,26 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 	defer guestClient.Close()
 
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
+	opts := guest.ExecOptions{
 		Command: cmdToRun,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
-	})
+	}
+	if interactiveStdin {
+		opts.Stdin = os.Stdin
+	}
+	exitCode, err := guestClient.Exec(context.Background(), opts)
 	if err != nil {
 		return err
 	}
 
 	if exitCode != 0 {
+		// os.Exit skips deferred calls: release the guest connection and the
+		// port-forward first, or every failing command leaks a kubectl process.
+		guestClient.Close()
+		if cleanup != nil {
+			cleanup()
+		}
 		os.Exit(exitCode)
 	}
 

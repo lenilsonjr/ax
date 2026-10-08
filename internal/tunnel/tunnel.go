@@ -215,6 +215,12 @@ func EnsureServerURL(opts Options) (string, error) {
 		_ = StopTunnel(existing)
 	}
 
+	// AX_NO_AUTO_TUNNEL=1: never fork a detached background port-forward; the
+	// caller runs its own visible tunnel and points AX_SERVER at it.
+	if os.Getenv("AX_NO_AUTO_TUNNEL") == "1" {
+		return "", fmt.Errorf("no AX_SERVER and AX_NO_AUTO_TUNNEL=1: start a tunnel to the controller or set AX_SERVER")
+	}
+
 	// Start new background port-forward for this context
 	dir, err := TunnelDir()
 	if err != nil {

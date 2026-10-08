@@ -179,6 +179,20 @@ message EgressAllowlist {
 message HostRule {
   string host = 1;
   int32 port = 2;
+  // Headers the egress gateway sets on requests to this host, with values
+  // resolved from a credential provider, so the secret never enters the
+  // sandbox. Needs a Substrate install with egress credential injection.
+  // Only valid on a hostname rule (not "*" or a CIDR).
+  repeated HeaderInjection inject = 3;
+}
+
+message HeaderInjection {
+  // HTTP request header to set, e.g. "authorization".
+  string header = 1;
+  // Prepended verbatim to the credential, e.g. "Bearer ".
+  string prefix = 2;
+  // Credential reference, ate-secret://<provider>/<name>/<tail>.
+  string credential_uri = 3;
 }
 
 // --- Workspace ---

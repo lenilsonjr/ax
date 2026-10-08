@@ -42,6 +42,9 @@ type ClientOptions struct {
 	CAFile      string
 	InsecureTLS bool
 	Plaintext   bool
+	// EgressTrustBundle names the Substrate trust bundle to project into every
+	// task (e.g. "egress-mitm.ate.dev" on an sdsmint install). Empty disables it.
+	EgressTrustBundle string
 }
 
 type tokenAuth struct {
@@ -67,8 +70,9 @@ func (t tokenAuth) RequireTransportSecurity() bool {
 
 // Client wraps the Substrate Control API client.
 type Client struct {
-	conn    *grpc.ClientConn
-	control ateapipb.ControlClient
+	conn              *grpc.ClientConn
+	control           ateapipb.ControlClient
+	egressTrustBundle string
 }
 
 // NewClientWithOptions connects to Substrate with full TLS and auth configuration.
@@ -144,8 +148,9 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 		return nil, fmt.Errorf("failed to connect to Substrate control service at %s: %w", opts.Target, err)
 	}
 	return &Client{
-		conn:    conn,
-		control: ateapipb.NewControlClient(conn),
+		conn:              conn,
+		control:           ateapipb.NewControlClient(conn),
+		egressTrustBundle: opts.EgressTrustBundle,
 	}, nil
 }
 
@@ -276,6 +281,43 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 	}
 }
 
+// EgressTrustBundleDir is where WithEgressTrustBundle mounts the bundle.
+const EgressTrustBundleDir = "/run/ate"
+
+// WithEgressTrustBundle projects the named Substrate trust bundle into the
+// template's containers and points the common TLS stacks at it. On an sdsmint
+// install the egress gateway terminates TLS with per-SNI leaves chaining to its
+// own CA, so without this every HTTPS request from the task fails. The bundle
+// becomes the only trust anchor, which matches that install: every connection
+// is re-originated by the gateway. A no-op when bundle is empty.
+func WithEgressTrustBundle(tmpl *ateapipb.ActorTemplate, bundle string) {
+	if tmpl == nil || bundle == "" {
+		return
+	}
+	tmpl.Volumes = append(tmpl.Volumes, &ateapipb.Volume{
+		Name: "egress-trust",
+		SystemInfo: &ateapipb.SystemInfoVolumeSource{
+			DataSources: []*ateapipb.SystemInfoDataSource{{
+				TrustBundle: &ateapipb.TrustBundleDataSource{Name: bundle, Path: "trust-bundle.pem"},
+			}},
+		},
+	})
+	pem := EgressTrustBundleDir + "/trust-bundle.pem"
+	for _, ctr := range tmpl.Containers {
+		ctr.VolumeMounts = append(ctr.VolumeMounts, &ateapipb.VolumeMount{Name: "egress-trust", MountPath: EgressTrustBundleDir})
+		for _, kv := range [][2]string{
+			{"SSL_CERT_FILE", pem}, // OpenSSL, Go, Python ssl, curl
+			// No SSL_CERT_DIR: it would point at a directory holding only this
+			// bundle, which strips the public roots for anything that reads it.
+			{"NODE_EXTRA_CA_CERTS", pem}, // Node/Bun (adds to, not replaces, its roots)
+			{"REQUESTS_CA_BUNDLE", pem},  // Python requests
+			{"GIT_SSL_CAINFO", pem},
+		} {
+			ctr.Env = append(ctr.Env, &ateapipb.EnvVar{Name: kv[0], Value: kv[1]})
+		}
+	}
+}
+
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
 func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
@@ -291,6 +333,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 	}
 
 	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "")
+	WithEgressTrustBundle(tmpl, c.egressTrustBundle)
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -446,20 +489,36 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	return nil
 }
 
-// ApplyEgressPolicy applies egress rules to the Actor from a Gateway's allowlist.
-func (c *Client) ApplyEgressPolicy(ctx context.Context, atespace, actorName string, allowlist *v1alpha1.EgressAllowlist) error {
-	if allowlist == nil || len(allowlist.Hosts) == 0 {
-		return nil
-	}
-
+// buildEgressRules translates a Gateway allowlist into Substrate egress rules.
+func buildEgressRules(allowlist *v1alpha1.EgressAllowlist) ([]*ateapipb.EgressRule, error) {
 	var patterns []string
 	var allowAll bool
 	var cidrs []string
+	// Substrate applies only the first matching rule's effects, so each host
+	// that injects headers gets its own rule, ahead of the plain allow rules.
+	var injectRules []*ateapipb.EgressRule
 
 	for _, h := range allowlist.Hosts {
+		if len(h.Inject) > 0 {
+			if h.Host == "*" || h.Host == "0.0.0.0/0" || strings.Contains(h.Host, "/") || h.Host == "" {
+				return nil, fmt.Errorf("host %q: inject requires a hostname rule", h.Host)
+			}
+			var effects ateapipb.EgressRuleEffects
+			for _, inj := range h.Inject {
+				effects.InjectStaticHeaders = append(effects.InjectStaticHeaders, &ateapipb.CredentialHeaderInjection{
+					Header:        inj.Header,
+					Prefix:        inj.Prefix,
+					CredentialUri: inj.CredentialUri,
+				})
+			}
+			injectRules = append(injectRules, &ateapipb.EgressRule{
+				Hostnames: &ateapipb.HostnameRule{Patterns: []string{h.Host}, Effects: &effects},
+			})
+			continue
+		}
 		if h.Host == "*" || h.Host == "0.0.0.0/0" {
 			allowAll = true
-			break
+			continue
 		}
 		if strings.Contains(h.Host, "/") {
 			cidrs = append(cidrs, h.Host)
@@ -468,7 +527,7 @@ func (c *Client) ApplyEgressPolicy(ctx context.Context, atespace, actorName stri
 		}
 	}
 
-	var rules []*ateapipb.EgressRule
+	rules := injectRules
 	if allowAll {
 		rules = append(rules, &ateapipb.EgressRule{
 			All: &emptypb.Empty{},
@@ -489,6 +548,19 @@ func (c *Client) ApplyEgressPolicy(ctx context.Context, atespace, actorName stri
 			})
 		}
 	}
+	return rules, nil
+}
+
+// ApplyEgressPolicy applies egress rules to the Actor from a Gateway's allowlist.
+func (c *Client) ApplyEgressPolicy(ctx context.Context, atespace, actorName string, allowlist *v1alpha1.EgressAllowlist) error {
+	if allowlist == nil || len(allowlist.Hosts) == 0 {
+		return nil
+	}
+
+	rules, err := buildEgressRules(allowlist)
+	if err != nil {
+		return err
+	}
 
 	egressPolicy := &ateapipb.EgressPolicy{
 		Metadata: &ateapipb.ResourceMetadata{
@@ -508,7 +580,7 @@ func (c *Client) ApplyEgressPolicy(ctx context.Context, atespace, actorName stri
 		Actor:        actorRef,
 		EgressPolicy: egressPolicy,
 	}
-	_, err := c.control.CreateActorEgressPolicy(ctx, createReq)
+	_, err = c.control.CreateActorEgressPolicy(ctx, createReq)
 	if err != nil {
 		if status.Code(err) == codes.AlreadyExists {
 			existing, getErr := c.control.GetActorEgressPolicy(ctx, &ateapipb.GetActorEgressPolicyRequest{

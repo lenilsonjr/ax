@@ -85,8 +85,11 @@ type ExecOptions struct {
 	Command []string
 	Cwd     string
 	Env     map[string]string
-	Stdout  io.Writer
-	Stderr  io.Writer
+	// Stdin, when set, is streamed to the process's standard input and then
+	// closed. When nil the process gets no stdin.
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 // Exec runs a command inside the task container and streams stdout/stderr until completion.
@@ -100,12 +103,19 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 		Command: opts.Command,
 		Cwd:     opts.Cwd,
 		Env:     opts.Env,
+		Stdin:   opts.Stdin != nil,
 	})
 	if err != nil {
 		return 1, fmt.Errorf("starting process: %w", err)
 	}
 
 	pid := proc.GetProcessId()
+	stdinErr := make(chan error, 1)
+	if opts.Stdin != nil {
+		go func() { stdinErr <- c.writeStdin(ctx, pid, opts.Stdin) }()
+	} else {
+		stdinErr <- nil
+	}
 	stream, err := c.process.StreamProcessOutput(ctx, &ateenvv1alpha.StreamProcessOutputRequest{
 		ProcessId: pid,
 		Follow:    true,
@@ -124,6 +134,8 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 			return 1, fmt.Errorf("receiving output stream: %w", err)
 		}
 		if exit := out.GetExit(); exit != nil {
+			// A process may exit without reading all of its input; that is
+			// not an error of the exec itself.
 			return int(exit.GetExitCode()), nil
 		}
 		if data := out.GetStdout(); len(data) > 0 && opts.Stdout != nil {
@@ -149,4 +161,32 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// writeStdin copies r to the process's stdin in chunks, then closes it.
+func (c *Client) writeStdin(ctx context.Context, pid string, r io.Reader) error {
+	ws, err := c.process.WriteProcessInput(ctx)
+	if err != nil {
+		return fmt.Errorf("opening stdin stream: %w", err)
+	}
+	buf := make([]byte, 64*1024)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			if err := ws.Send(&ateenvv1alpha.WriteProcessInputRequest{ProcessId: pid, Data: append([]byte(nil), buf[:n]...)}); err != nil {
+				return fmt.Errorf("writing stdin: %w", err)
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("reading stdin: %w", rerr)
+		}
+	}
+	if err := ws.Send(&ateenvv1alpha.WriteProcessInputRequest{ProcessId: pid, Close: true}); err != nil {
+		return fmt.Errorf("closing stdin: %w", err)
+	}
+	_, err = ws.CloseAndRecv()
+	return err
 }

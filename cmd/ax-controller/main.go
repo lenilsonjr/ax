@@ -38,6 +38,7 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		egressTrustBundle       string
 		redisAddr               string
 		redisPassword           string
 		redisGroup              string
@@ -56,6 +57,7 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&egressTrustBundle, "egress-trust-bundle", "", "Substrate trust bundle to project into every task at /run/ate (set to egress-mitm.ate.dev on an sdsmint install, whose egress gateway terminates TLS)")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -75,6 +77,7 @@ func main() {
 		"authority", substrateAuthority,
 		"templateAtespace", defaultTemplateAtespace,
 		"template", defaultTemplate,
+		"egressTrustBundle", egressTrustBundle,
 	)
 
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
@@ -84,6 +87,8 @@ func main() {
 		CAFile:      substrateCAFile,
 		InsecureTLS: substrateInsecureTLS,
 		Plaintext:   substratePlaintext,
+
+		EgressTrustBundle: egressTrustBundle,
 	})
 	if err != nil {
 		slog.Error("failed to initialize substrate client", "error", err)
