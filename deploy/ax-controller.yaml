@@ -76,6 +76,10 @@ spec:
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
             - "--template=default-template"
             - "--template-atespace=ax-system"
+            # The flag above it is this fork's; without this line the controller
+            # projects no CA and every task on an sdsmint install loses HTTPS,
+            # because the egress gateway terminates TLS with its own cert.
+            - "--egress-trust-bundle=egress-mitm.ate.dev"
           env:
             - name: ATENET_ROUTER_ADDR
               value: "atenet-router.ate-system.svc.cluster.local:80"
